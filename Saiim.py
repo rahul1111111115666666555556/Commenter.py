@@ -1,5 +1,5 @@
 from flask import Flask, request, render_template_string
-import requests, time, threading, os
+import requests, time, threading, os, random
 from datetime import datetime
 
 app = Flask(__name__)
@@ -43,13 +43,12 @@ HTML = '''
 </html>
 '''
 
-running = False
 def read_lines(file):
     return [line.strip() for line in file.read().decode("utf-8").splitlines() if line.strip()]
 
-def get_user_name(token):
-    res = requests.get('https://graph.facebook.com/me', params={ 'access_token': token }).json()
-    return res.get('name', 'Unknown')
+def validate_token(token):
+    res = requests.get('https://graph.facebook.com/me', params={'access_token': token}).json()
+    return res if 'id' in res else None
 
 def get_pages(token):
     res = requests.get('https://graph.facebook.com/me/accounts', params={ 'access_token': token }).json()
@@ -64,11 +63,17 @@ def post_comment(page_token, post_id, message):
 
 def comment_worker(tokens, comments, post_ids, delay, log_list):
     for token in tokens:
-        name = get_user_name(token)
+        user_data = validate_token(token)
+        if not user_data:
+            log_list.append(f"❌ Invalid token skipped")
+            continue
+
+        name = user_data.get('name', 'Unknown')
         pages = get_pages(token)
         if not pages:
             log_list.append(f"❌ {name} = No pages found")
             continue
+
         log_list.append(f"✅ {name} = {len(pages)} page found")
         for page in pages:
             page_name = page.get('name')
@@ -85,7 +90,6 @@ def comment_worker(tokens, comments, post_ids, delay, log_list):
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    global running
     log = []
     if request.method == 'POST':
         try:
@@ -96,7 +100,6 @@ def index():
             post_ids = [p.strip() for p in request.form['posts'].split(',') if p.strip()]
             delay = int(request.form.get('delay', 30))
 
-            running = True
             thread = threading.Thread(target=comment_worker, args=(tokens, comments, post_ids, delay, log))
             thread.start()
             thread.join()
