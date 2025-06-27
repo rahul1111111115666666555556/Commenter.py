@@ -1,28 +1,24 @@
-from flask import Flask, request, render_template_string, redirect
-import requests, time, random, threading, os
-from datetime import datetime, timedelta
-from werkzeug.utils import secure_filename
+from flask import Flask, request, render_template_string
+import requests, time, threading, os
+from datetime import datetime
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
 HTML = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>FB Auto Commenter</title>
+    <title>FB Page Auto Commenter</title>
     <style>
-        body { font-family: Arial, sans-serif; background: #f0f0f0; padding: 20px; }
-        .container { max-width: 600px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px #ccc; }
-        input, textarea, button, label { width: 100%; margin: 8px 0; }
-        button { background: green; color: white; border: none; padding: 10px; border-radius: 5px; cursor: pointer; }
-        .log { white-space: pre-wrap; background: #eee; padding: 10px; height: 300px; overflow-y: scroll; }
+        body { font-family: Arial; background: #f5f5f5; padding: 20px; }
+        .container { background: white; padding: 20px; border-radius: 10px; max-width: 600px; margin: auto; box-shadow: 0 0 10px #ccc; }
+        input, textarea, button { width: 100%; margin: 10px 0; padding: 10px; }
+        button { background: green; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        .log { background: #eee; padding: 10px; white-space: pre-wrap; height: 300px; overflow-y: scroll; border-radius: 5px; }
     </style>
 </head>
 <body>
 <div class="container">
-    <h2>Facebook Auto Commenter</h2>
+    <h2>Facebook Page Auto Commenter</h2>
     <form method="POST" enctype="multipart/form-data">
         <label>Upload Token File:</label>
         <input type="file" name="token_file" required>
@@ -30,20 +26,13 @@ HTML = '''
         <label>Upload Comments File:</label>
         <input type="file" name="comment_file" required>
 
-        <label>Post IDs (comma separated):</label>
+        <label>Post IDs (comma-separated):</label>
         <input type="text" name="posts" required>
 
-        <label>Delay in seconds:</label>
-        <input type="number" name="delay" value="60" required>
-
-        <label>Haters Name (prefix):</label>
-        <input type="text" name="haters">
-
-        <label>Append 'here' at end?</label>
-        <input type="checkbox" name="here" checked>
+        <label>Delay (seconds):</label>
+        <input type="number" name="delay" value="30">
 
         <button name="action" value="start">Start Commenting</button>
-        <button name="action" value="stop" style="background:red;">Stop Bot</button>
     </form>
     {% if log %}
     <h3>Logs:</h3>
@@ -55,88 +44,65 @@ HTML = '''
 '''
 
 running = False
-thread = None
-
-
-def read_file(file):
+def read_lines(file):
     return [line.strip() for line in file.read().decode("utf-8").splitlines() if line.strip()]
 
-def random_comment(template):
-    while '{' in template:
-        start = template.find('{')
-        end = template.find('}')
-        options = template[start+1:end].split('|')
-        template = template[:start] + random.choice(options) + template[end+1:]
-    return template
+def get_user_name(token):
+    res = requests.get('https://graph.facebook.com/me', params={ 'access_token': token }).json()
+    return res.get('name', 'Unknown')
 
-def comment_worker(tokens, comments, post_ids, delay, haters, add_here):
-    global running
-    cooldown = {t: datetime.min for t in tokens}
-    success = 0
-    i = 0
-    log_output = ""
+def get_pages(token):
+    res = requests.get('https://graph.facebook.com/me/accounts', params={ 'access_token': token }).json()
+    return res.get('data', [])
 
-    while running and tokens:
-        now = datetime.now()
-        available = [t for t in tokens if now >= cooldown[t]]
-        if not available:
-            time.sleep(3)
+def post_comment(page_token, post_id, message):
+    res = requests.post(f'https://graph.facebook.com/{post_id}/comments', data={
+        'message': message,
+        'access_token': page_token
+    }).json()
+    return res
+
+def comment_worker(tokens, comments, post_ids, delay, log_list):
+    for token in tokens:
+        name = get_user_name(token)
+        pages = get_pages(token)
+        if not pages:
+            log_list.append(f"❌ {name} = No pages found")
             continue
-
-        token = available[i % len(available)]
-        comment = random_comment(random.choice(comments))
-        message = f"{haters} {comment}"
-        if add_here:
-            message += " here"
-
-        post_id = random.choice(post_ids)
-        res = requests.post(f"https://graph.facebook.com/{post_id}/comments", data={
-            'message': message,
-            'access_token': token
-        }).json()
-
-        if 'id' in res:
-            success += 1
-            print(f"✅ {message}")
-        else:
-            error = res.get('error', {}).get('message', 'Unknown error')
-            print(f"❌ {error}")
-            if 'invalid' in error or 'session' in error:
-                tokens.remove(token)
-                cooldown.pop(token, None)
-                continue
-            cooldown[token] = datetime.now() + timedelta(minutes=15)
-
-        time.sleep(delay)
-        i += 1
+        log_list.append(f"✅ {name} = {len(pages)} page found")
+        for page in pages:
+            page_name = page.get('name')
+            page_token = page.get('access_token')
+            comment = random.choice(comments)
+            post_id = random.choice(post_ids)
+            res = post_comment(page_token, post_id, comment)
+            if 'id' in res:
+                log_list.append(f"✅ Comment posted by {page_name} to {post_id}")
+            else:
+                error = res.get('error', {}).get('message', 'Unknown error')
+                log_list.append(f"❌ Failed by {page_name}: {error}")
+            time.sleep(delay)
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    global running, thread
-    log = ""
+    global running
+    log = []
     if request.method == 'POST':
-        action = request.form.get('action')
-        if action == 'stop':
-            running = False
-            return render_template_string(HTML, log="⛔ Bot Stopped.")
-
         try:
             token_file = request.files['token_file']
             comment_file = request.files['comment_file']
-            tokens = read_file(token_file)
-            comments = read_file(comment_file)
-            post_ids = request.form['posts'].split(',')
-            delay = int(request.form['delay'])
-            haters = request.form['haters']
-            add_here = 'here' in request.form
+            tokens = read_lines(token_file)
+            comments = read_lines(comment_file)
+            post_ids = [p.strip() for p in request.form['posts'].split(',') if p.strip()]
+            delay = int(request.form.get('delay', 30))
 
             running = True
-            thread = threading.Thread(target=comment_worker, args=(tokens, comments, post_ids, delay, haters, add_here))
+            thread = threading.Thread(target=comment_worker, args=(tokens, comments, post_ids, delay, log))
             thread.start()
-            return render_template_string(HTML, log="🚀 Bot Started...")
+            thread.join()
         except Exception as e:
-            return render_template_string(HTML, log=f"❌ Error: {str(e)}")
-    return render_template_string(HTML, log="")
+            log.append(f"❌ Error: {str(e)}")
+    return render_template_string(HTML, log='\n'.join(log))
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
